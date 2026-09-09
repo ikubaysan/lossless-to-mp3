@@ -312,11 +312,46 @@ class FFmpegConverter:
                 ),
             )
 
-        # Move the completed file into place. os.replace is atomic on
-        # both POSIX and Windows and will overwrite an existing file,
-        # so this is safe even if something else raced to create
-        # `destination` in the meantime.
-        os.replace(temp_destination, destination)
+        # Move the completed file into place.
+        #
+        # On Windows, another process may briefly keep the temporary
+        # MP3 open after FFmpeg exits. Retry the move before giving up.
+        # This prevents one locked file from terminating the entire run.
+        move_error: OSError | None = None
+
+        for attempt in range(1, 11):
+            try:
+                os.replace(temp_destination, destination)
+                move_error = None
+                break
+
+            except OSError as exc:
+                move_error = exc
+
+                if attempt < 10:
+                    logging.warning(
+                        "Could not move completed MP3 into place "
+                        "(attempt %d/10). Retrying in 1 second: %s",
+                        attempt,
+                        exc,
+                    )
+
+                    import time
+                    time.sleep(1)
+
+        if move_error is not None:
+            if temp_destination.exists():
+                temp_destination.unlink()
+
+            return ConversionResult(
+                source=source,
+                destination=destination,
+                success=False,
+                error=(
+                    "Could not move completed MP3 into place after "
+                    f"10 attempts: {move_error}"
+                ),
+            )
 
         if artwork_dropped:
             logging.warning(
