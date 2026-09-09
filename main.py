@@ -39,7 +39,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-
+import os
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -137,24 +137,31 @@ class FFmpegConverter:
         """Return True if FFmpeg can be found."""
         return shutil.which(self.ffmpeg_path) is not None
 
-    def convert(
+    def _build_command(
         self,
         source: Path,
-        destination: Path,
-    ) -> ConversionResult:
-        """
-        Convert one file to MP3.
+        temp_destination: Path,
+        include_artwork: bool,
+    ) -> list[str]:
+        """Build the FFmpeg command line, always writing to a temp path.
 
-        - libmp3lame encoder
-        - 320 kbps CBR
-        - Copy metadata
-        - Copy embedded artwork
-        - Preserve artwork as an attached picture stream
-        """
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        include_artwork controls whether the embedded picture stream
+        (if any) is mapped and re-attached. Some source files declare
+        a mismatched MIME type for their embedded picture (e.g. FLAC
+        metadata says "image/png" but the bytes are actually JPEG).
+        FFmpeg trusts the declared type to choose a decoder, fails to
+        decode, and aborts the whole mux -- even though the audio is
+        fine. Setting include_artwork=False lets us retry audio-only.
 
+        Always writes to temp_destination with -y: the temp path is
+        unique per attempt, so there is nothing to protect against
+        overwriting. Overwrite protection for the *real* destination
+        is enforced separately, at the point the temp file is moved
+        into place.
+        """
         command: list[str] = [
             self.ffmpeg_path,
+            "-y",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -162,8 +169,12 @@ class FFmpegConverter:
             str(source),
             "-map",
             "0:a:0",
-            "-map",
-            "0:v?",
+        ]
+
+        if include_artwork:
+            command += ["-map", "0:v?"]
+
+        command += [
             "-c:a",
             "libmp3lame",
             "-b:a",
@@ -172,26 +183,67 @@ class FFmpegConverter:
             "0",
             "-id3v2_version",
             "3",
-            "-c:v",
-            "copy",
-            "-disposition:v:0",
-            "attached_pic",
         ]
 
-        if self.overwrite:
-            command.insert(1, "-y")
-        else:
-            command.insert(1, "-n")
+        if include_artwork:
+            command += [
+                "-c:v",
+                "copy",
+                "-disposition:v:0",
+                "attached_pic",
+            ]
 
-        command.append(str(destination))
+        command.append(str(temp_destination))
+
+        return command
+
+    def _run_ffmpeg(
+        self,
+        command: list[str],
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def convert(
+        self,
+        source: Path,
+        destination: Path,
+    ) -> ConversionResult:
+        """
+        Convert one file to MP3.
+
+        - libmp3lame encoder, 320 kbps CBR
+        - Copies metadata and embedded artwork when possible
+        - Falls back to audio-only (no artwork) if the embedded
+          picture is corrupt or has a mismatched MIME type, which
+          would otherwise abort the entire conversion
+        - Writes to a temporary file first and only moves it to the
+          final destination on success, so a failed or interrupted
+          conversion never leaves a broken/empty .mp3 behind and
+          never confuses a later attempt into thinking output exists
+        """
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_destination = destination.with_name(
+            f"{destination.stem}.converting-{os.getpid()}.mp3"
+        )
+
+        # Clean up any stale temp file from a previous crashed run.
+        if temp_destination.exists():
+            temp_destination.unlink()
+
+        command = self._build_command(
+            source,
+            temp_destination,
+            include_artwork=True,
+        )
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            result = self._run_ffmpeg(command)
 
         except OSError as exc:
             return ConversionResult(
@@ -201,11 +253,43 @@ class FFmpegConverter:
                 error=str(exc),
             )
 
+        artwork_dropped = False
+
+        if result.returncode != 0 or not temp_destination.exists():
+            # Retry without artwork. This recovers files whose embedded
+            # picture is corrupt or mislabeled (e.g. JPEG bytes tagged
+            # as image/png), which otherwise fails the whole file even
+            # though the audio stream itself is completely fine.
+            if temp_destination.exists():
+                temp_destination.unlink()
+
+            fallback_command = self._build_command(
+                source,
+                temp_destination,
+                include_artwork=False,
+            )
+
+            try:
+                result = self._run_ffmpeg(fallback_command)
+
+            except OSError as exc:
+                return ConversionResult(
+                    source=source,
+                    destination=destination,
+                    success=False,
+                    error=str(exc),
+                )
+
+            artwork_dropped = True
+
         if result.returncode != 0:
             error = (
                 result.stderr.strip()
                 or "FFmpeg returned a non-zero exit code."
             )
+
+            if temp_destination.exists():
+                temp_destination.unlink()
 
             return ConversionResult(
                 source=source,
@@ -214,8 +298,10 @@ class FFmpegConverter:
                 error=error,
             )
 
-        # FFmpeg can return success even if the output is unexpectedly empty.
-        if not destination.exists() or destination.stat().st_size == 0:
+        if not temp_destination.exists() or temp_destination.stat().st_size == 0:
+            if temp_destination.exists():
+                temp_destination.unlink()
+
             return ConversionResult(
                 source=source,
                 destination=destination,
@@ -226,12 +312,24 @@ class FFmpegConverter:
                 ),
             )
 
+        # Move the completed file into place. os.replace is atomic on
+        # both POSIX and Windows and will overwrite an existing file,
+        # so this is safe even if something else raced to create
+        # `destination` in the meantime.
+        os.replace(temp_destination, destination)
+
+        if artwork_dropped:
+            logging.warning(
+                "Converted without embedded artwork "
+                "(source picture was corrupt or mislabeled): %s",
+                destination,
+            )
+
         return ConversionResult(
             source=source,
             destination=destination,
             success=True,
         )
-
 
 # ---------------------------------------------------------------------------
 # Main conversion manager
@@ -523,7 +621,21 @@ def main() -> int:
 
     args = parse_arguments()
 
-    # Validate ALL input directories before doing anything else.
+    # -----------------------------------------------------------------------
+    # Validate input directories BEFORE starting any conversion.
+    # -----------------------------------------------------------------------
+
+    print()
+    print("Input directories:")
+    print("-" * 80)
+
+    for index, directory in enumerate(args.input_directories, start=1):
+        print(f"{index:>5}. {directory}")
+
+    print("-" * 80)
+    print(f"Total input directories: {len(args.input_directories)}")
+    print()
+
     invalid_directories = [
         directory
         for directory in args.input_directories
@@ -545,6 +657,16 @@ def main() -> int:
         )
 
         return 1
+
+    logging.info(
+        "All %d input director%s validated successfully.",
+        len(args.input_directories),
+        "y" if len(args.input_directories) == 1 else "ies",
+    )
+
+    # -----------------------------------------------------------------------
+    # Continue with the rest of the startup process.
+    # -----------------------------------------------------------------------
 
     converter = LosslessToMP3Converter(
         input_directories=args.input_directories,
