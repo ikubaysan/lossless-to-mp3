@@ -3,7 +3,8 @@ Recursively convert supported audio files to MP3 320 kbps using FFmpeg.
 
 Features:
 - Object-oriented design with type hints.
-- Recursively scans directories.
+- Recursively scans multiple input directories.
+- Validates all input directories before starting.
 - Dry-run mode lists targeted files without modifying anything.
 - Preserves metadata and embedded album artwork.
 - Deletes the original only after a successful conversion.
@@ -16,17 +17,17 @@ Requirements:
     FFmpeg must be installed and available in PATH.
 
 Examples:
-    # List all files that would be converted:
-    python lossless_to_mp3.py "D:\\Music" --dry-run
+    # Convert multiple directories:
+    python lossless_to_mp3.py "D:\\Music" "E:\\More Music"
 
-    # Convert in place and delete originals:
-    python lossless_to_mp3.py "D:\\Music"
+    # List all files that would be converted:
+    python lossless_to_mp3.py "D:\\Music" "E:\\More Music" --dry-run
 
     # Convert to a separate directory:
-    python lossless_to_mp3.py "D:\\Music" --output-dir "D:\\MP3"
+    python lossless_to_mp3.py "D:\\Music" "E:\\More Music" --output-dir "D:\\MP3"
 
     # Convert only, without deleting originals:
-    python lossless_to_mp3.py "D:\\Music" --keep-originals
+    python lossless_to_mp3.py "D:\\Music" "E:\\More Music" --keep-originals
 """
 
 from __future__ import annotations
@@ -101,11 +102,6 @@ class LosslessFileScanner:
 
         Files are sorted for predictable output.
         """
-        if not self.root_directory.is_dir():
-            raise NotADirectoryError(
-                f"Directory does not exist: {self.root_directory}"
-            )
-
         files: list[Path] = []
 
         for path in self.root_directory.rglob("*"):
@@ -246,18 +242,21 @@ class LosslessToMP3Converter:
 
     def __init__(
         self,
-        input_directory: Path,
+        input_directories: list[Path],
         output_directory: Path | None = None,
         ffmpeg_path: str = "ffmpeg",
         bitrate: str = "320k",
         keep_originals: bool = False,
         overwrite: bool = False,
     ) -> None:
-        self.input_directory = input_directory
+        self.input_directories = input_directories
         self.output_directory = output_directory
         self.keep_originals = keep_originals
 
-        self.scanner = LosslessFileScanner(input_directory)
+        self.scanners = [
+            LosslessFileScanner(directory)
+            for directory in input_directories
+        ]
 
         self.converter = FFmpegConverter(
             ffmpeg_path=ffmpeg_path,
@@ -265,9 +264,21 @@ class LosslessToMP3Converter:
             overwrite=overwrite,
         )
 
-    def get_target_files(self) -> list[Path]:
-        """Return all files that would be targeted."""
-        files = self.scanner.find_files()
+    def get_target_files(self) -> list[tuple[Path, Path]]:
+        """
+        Return all files that would be targeted.
+
+        Each tuple contains:
+            (source_file, input_root_directory)
+
+        Keeping the root directory allows the destination path to be
+        calculated correctly when multiple input directories are used.
+        """
+        files: list[tuple[Path, Path]] = []
+
+        for scanner in self.scanners:
+            for source in scanner.find_files():
+                files.append((source, scanner.root_directory))
 
         # If using a separate output directory, don't accidentally scan it.
         if self.output_directory is not None:
@@ -275,17 +286,22 @@ class LosslessToMP3Converter:
                 output_resolved = self.output_directory.resolve()
 
                 files = [
-                    path
-                    for path in files
-                    if output_resolved not in path.resolve().parents
-                    and path.resolve() != output_resolved
+                    (source, root)
+                    for source, root in files
+                    if output_resolved not in source.resolve().parents
+                    and source.resolve() != output_resolved
                 ]
+
             except OSError:
                 pass
 
-        return files
+        return sorted(files, key=lambda item: str(item[0]))
 
-    def get_destination(self, source: Path) -> Path:
+    def get_destination(
+        self,
+        source: Path,
+        input_root: Path,
+    ) -> Path:
         """
         Determine the output MP3 path.
 
@@ -297,11 +313,11 @@ class LosslessToMP3Converter:
             Music/Artist/Album/song.flac
             -> MP3/Artist/Album/song.mp3
         """
-        relative_path = source.relative_to(self.input_directory)
-        destination_relative = relative_path.with_suffix(".mp3")
-
         if self.output_directory is None:
             return source.with_suffix(".mp3")
+
+        relative_path = source.relative_to(input_root)
+        destination_relative = relative_path.with_suffix(".mp3")
 
         return self.output_directory / destination_relative
 
@@ -313,8 +329,8 @@ class LosslessToMP3Converter:
         print("Files that would be targeted:")
         print("-" * 80)
 
-        for index, path in enumerate(files, start=1):
-            print(f"{index:>5}. {path}")
+        for index, (source, _) in enumerate(files, start=1):
+            print(f"{index:>5}. {source}")
 
         print("-" * 80)
         print(f"Total files: {len(files)}")
@@ -337,8 +353,8 @@ class LosslessToMP3Converter:
         deletion_failed_count = 0
         skipped_count = 0
 
-        for index, source in enumerate(files, start=1):
-            destination = self.get_destination(source)
+        for index, (source, input_root) in enumerate(files, start=1):
+            destination = self.get_destination(source, input_root)
 
             logging.info(
                 "[%d/%d] Converting: %s",
@@ -448,9 +464,13 @@ def parse_arguments() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "input_directory",
+        "input_directories",
         type=Path,
-        help="Directory to recursively scan.",
+        nargs="+",
+        help=(
+            "One or more directories to recursively scan. "
+            "All directories are validated before conversion begins."
+        ),
     )
 
     parser.add_argument(
@@ -503,15 +523,31 @@ def main() -> int:
 
     args = parse_arguments()
 
-    if not args.input_directory.is_dir():
+    # Validate ALL input directories before doing anything else.
+    invalid_directories = [
+        directory
+        for directory in args.input_directories
+        if not directory.is_dir()
+    ]
+
+    if invalid_directories:
         logging.error(
-            "Input directory does not exist: %s",
-            args.input_directory,
+            "The following input directories do not exist "
+            "or are not directories:"
         )
+
+        for directory in invalid_directories:
+            logging.error("  %s", directory)
+
+        logging.error(
+            "No conversions were started because one or more "
+            "input directories are invalid."
+        )
+
         return 1
 
     converter = LosslessToMP3Converter(
-        input_directory=args.input_directory,
+        input_directories=args.input_directories,
         output_directory=args.output_dir,
         ffmpeg_path=args.ffmpeg,
         keep_originals=args.keep_originals,
