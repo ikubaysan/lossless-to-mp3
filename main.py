@@ -1,5 +1,5 @@
 """
-Recursively convert lossless audio files to MP3 320 kbps using FFmpeg.
+Recursively convert supported audio files to MP3 320 kbps using FFmpeg.
 
 Features:
 - Object-oriented design with type hints.
@@ -10,6 +10,7 @@ Features:
 - Logs conversion and deletion failures.
 - Skips existing MP3 files.
 - Avoids overwriting existing MP3 files by default.
+- Converts ALL .m4a files, regardless of their internal codec.
 
 Requirements:
     FFmpeg must be installed and available in PATH.
@@ -37,16 +38,17 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Extensions that are generally lossless audio formats.
-# M4A is handled separately because it can contain either ALAC or AAC.
-LOSSLESS_EXTENSIONS: frozenset[str] = frozenset(
+# Audio extensions to convert.
+#
+# M4A files are included regardless of their internal codec.
+# This means both ALAC and AAC M4A files will be targeted.
+CONVERTIBLE_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".flac",
         ".wav",
@@ -59,11 +61,9 @@ LOSSLESS_EXTENSIONS: frozenset[str] = frozenset(
         ".tak",
         ".dsf",
         ".dff",
+        ".m4a",
     }
 )
-
-# M4A files need to be inspected to determine whether they contain ALAC.
-M4A_EXTENSION = ".m4a"
 
 # Log file written in the current working directory.
 LOG_FILE = "lossless_to_mp3.log"
@@ -88,14 +88,16 @@ class ConversionResult:
 # ---------------------------------------------------------------------------
 
 class LosslessFileScanner:
-    """Finds lossless audio files recursively."""
+    """Finds supported audio files recursively."""
 
     def __init__(self, root_directory: Path) -> None:
         self.root_directory = root_directory
 
     def find_files(self) -> list[Path]:
         """
-        Return all supported lossless audio files recursively.
+        Return all supported audio files recursively.
+
+        M4A files are included regardless of their internal codec.
 
         Files are sorted for predictable output.
         """
@@ -112,7 +114,7 @@ class LosslessFileScanner:
 
             extension = path.suffix.lower()
 
-            if extension in LOSSLESS_EXTENSIONS:
+            if extension in CONVERTIBLE_EXTENSIONS:
                 files.append(path)
 
         return sorted(files)
@@ -123,7 +125,7 @@ class LosslessFileScanner:
 # ---------------------------------------------------------------------------
 
 class FFmpegConverter:
-    """Converts lossless audio files to MP3 using FFmpeg."""
+    """Converts supported audio files to MP3 using FFmpeg."""
 
     def __init__(
         self,
@@ -138,50 +140,6 @@ class FFmpegConverter:
     def is_available(self) -> bool:
         """Return True if FFmpeg can be found."""
         return shutil.which(self.ffmpeg_path) is not None
-
-    def is_lossless_m4a(self, path: Path) -> bool:
-        """
-        Return True if an M4A file contains a lossless ALAC stream.
-
-        This uses ffprobe, which is included with FFmpeg.
-        """
-        ffprobe_path = self.ffmpeg_path.replace("ffmpeg", "ffprobe")
-
-        if shutil.which(ffprobe_path) is None:
-            logging.warning(
-                "Cannot inspect M4A codec because ffprobe was not found: %s",
-                path,
-            )
-            return False
-
-        command: list[str] = [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ]
-
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            codec = result.stdout.strip().lower()
-
-            return codec == "alac"
-
-        except OSError as exc:
-            logging.error("Failed to inspect M4A file %s: %s", path, exc)
-            return False
 
     def convert(
         self,
@@ -248,7 +206,10 @@ class FFmpegConverter:
             )
 
         if result.returncode != 0:
-            error = result.stderr.strip() or "FFmpeg returned a non-zero exit code."
+            error = (
+                result.stderr.strip()
+                or "FFmpeg returned a non-zero exit code."
+            )
 
             return ConversionResult(
                 source=source,
@@ -263,7 +224,10 @@ class FFmpegConverter:
                 source=source,
                 destination=destination,
                 success=False,
-                error="FFmpeg reported success, but the output file is missing or empty.",
+                error=(
+                    "FFmpeg reported success, but the output file "
+                    "is missing or empty."
+                ),
             )
 
         return ConversionResult(
@@ -362,10 +326,10 @@ class LosslessToMP3Converter:
         files = self.get_target_files()
 
         if not files:
-            logging.info("No lossless files found.")
+            logging.info("No supported audio files found.")
             return
 
-        logging.info("Found %d lossless file(s).", len(files))
+        logging.info("Found %d audio file(s).", len(files))
 
         converted_count = 0
         failed_count = 0
@@ -478,7 +442,7 @@ def parse_arguments() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively convert lossless audio files to MP3 320 kbps "
+            "Recursively convert supported audio files to MP3 320 kbps "
             "using FFmpeg."
         )
     )
